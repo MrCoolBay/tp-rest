@@ -1,13 +1,13 @@
 import json
 import os
 import secrets
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="API d'administration de conteneurs", version="1.0.0")
 bearer = HTTPBearer(auto_error=False)
@@ -25,6 +25,11 @@ class Conteneur(BaseModel):
     name: str
     image: str
     state: str
+
+
+class ConteneurACreer(BaseModel):
+    name: str = Field(pattern=r"^[a-z][a-z0-9-]{1,30}$")
+    image: Literal["nginx:alpine", "redis:alpine", "httpd:alpine"]
 
 
 def configuration(nom):
@@ -84,6 +89,50 @@ def lire_conteneur(identifiant):
     )
 
 
+def netbox(methode, chemin, **options):
+    url = configuration("NETBOX_URL").rstrip("/") + "/api" + chemin
+    entetes = {"Authorization": f"Bearer {configuration('NETBOX_TOKEN')}", "Accept": "application/json"}
+    try:
+        reponse = requests.request(methode, url, headers=entetes, timeout=10, **options)
+    except requests.RequestException:
+        raise HTTPException(502, "NetBox injoignable") from None
+    if not reponse.ok:
+        raise HTTPException(502, f"Erreur NetBox ({reponse.status_code})")
+    return reponse
+
+
+def cluster_netbox():
+    chemin = "/virtualization/clusters/"
+    clusters = netbox("GET", chemin, params={"name": "docker-local"}).json()["results"]
+    if clusters:
+        return clusters[0]["id"]
+    types = netbox("GET", "/virtualization/cluster-types/", params={"slug": "docker"}).json()["results"]
+    if types:
+        type_id = types[0]["id"]
+    else:
+        type_id = netbox("POST", "/virtualization/cluster-types/",
+                         json={"name": "Docker", "slug": "docker"}).json()["id"]
+    return netbox("POST", chemin, json={"name": "docker-local", "type": type_id}).json()["id"]
+
+
+def synchroniser(conteneur, supprimer=False):
+    chemin = "/virtualization/virtual-machines/"
+    cluster_id = cluster_netbox()
+    machines = netbox("GET", chemin, params={"name": conteneur.name, "cluster_id": cluster_id}).json()["results"]
+    if supprimer:
+        for machine in machines:
+            netbox("DELETE", f"{chemin}{machine['id']}/")
+        return
+    corps = {
+        "name": conteneur.name, "cluster": cluster_id,
+        "status": "active" if conteneur.state == "running" else "offline",
+    }
+    if machines:
+        netbox("PATCH", f"{chemin}{machines[0]['id']}/", json=corps)
+    else:
+        netbox("POST", chemin, json=corps)
+
+
 @app.get("/health", summary="Vérifie que l'API répond")
 def sante():
     return {"status": "ok"}
@@ -100,3 +149,52 @@ def lister():
          dependencies=[Depends(verifier_role)], summary="Détail d'un conteneur géré")
 def lire(identifiant: str):
     return lire_conteneur(identifiant)
+
+
+@app.post("/containers", status_code=201, response_model=Conteneur,
+          responses={code: ERREURS[code] for code in (401, 403, 409)},
+          dependencies=[Depends(verifier_admin)], summary="Crée et démarre un conteneur")
+def creer(corps: ConteneurACreer):
+    resultat = docker("POST", "/containers/create", params={"name": corps.name},
+                      json={"Image": corps.image, "Labels": {ETIQUETTE: "true"}}).json()
+    identifiant = resultat["Id"]
+    docker("POST", f"/containers/{identifiant}/start")
+    conteneur = lire_conteneur(identifiant)
+    synchroniser(conteneur)
+    return conteneur
+
+
+def changer_etat(identifiant, action):
+    conteneur = lire_conteneur(identifiant)
+    if (action == "start" and conteneur.state == "running") or (
+        action == "stop" and conteneur.state != "running"
+    ):
+        raise HTTPException(409, "Le conteneur est déjà dans cet état")
+    docker("POST", f"/containers/{conteneur.id}/{action}", params={"t": 1})
+    conteneur = lire_conteneur(conteneur.id)
+    synchroniser(conteneur)
+    return conteneur
+
+
+@app.post("/containers/{identifiant}/stop", response_model=Conteneur,
+          responses=ERREURS, dependencies=[Depends(verifier_admin)],
+          summary="Arrête un conteneur géré")
+def arreter(identifiant: str):
+    return changer_etat(identifiant, "stop")
+
+
+@app.post("/containers/{identifiant}/start", response_model=Conteneur,
+          responses=ERREURS, dependencies=[Depends(verifier_admin)],
+          summary="Démarre un conteneur géré")
+def demarrer(identifiant: str):
+    return changer_etat(identifiant, "start")
+
+
+@app.delete("/containers/{identifiant}", status_code=204,
+            responses={code: ERREURS[code] for code in (401, 403, 404)},
+            dependencies=[Depends(verifier_admin)], summary="Supprime un conteneur géré")
+def supprimer(identifiant: str):
+    conteneur = lire_conteneur(identifiant)
+    docker("DELETE", f"/containers/{conteneur.id}", params={"force": "true"})
+    synchroniser(conteneur, supprimer=True)
+    return Response(status_code=204)
