@@ -1,17 +1,24 @@
 import json
+import logging
 import os
 import secrets
+from collections import Counter
+from threading import Lock
 from typing import Annotated, Literal
 from urllib.parse import quote
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="API d'administration de conteneurs", version="1.0.0")
 bearer = HTTPBearer(auto_error=False)
 ETIQUETTE = "adminapi.managed"
+verrou_webhook = Lock()
+remediations = 0
+journal = logging.getLogger("uvicorn.error")
 ERREURS = {
     401: {"description": "Token absent ou inconnu"},
     403: {"description": "Rôle insuffisant"},
@@ -30,6 +37,11 @@ class Conteneur(BaseModel):
 class ConteneurACreer(BaseModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9-]{1,30}$")
     image: Literal["nginx:alpine", "redis:alpine", "httpd:alpine"]
+
+
+class Alerte(BaseModel):
+    alert: Literal["container_down"]
+    container: str = Field(pattern=r"^[a-z][a-z0-9-]{1,30}$")
 
 
 def configuration(nom):
@@ -198,3 +210,48 @@ def supprimer(identifiant: str):
     docker("DELETE", f"/containers/{conteneur.id}", params={"force": "true"})
     synchroniser(conteneur, supprimer=True)
     return Response(status_code=204)
+
+
+def verifier_secret(x_webhook_secret: Annotated[str | None, Header()] = None):
+    attendu = configuration("WEBHOOK_SECRET")
+    if not x_webhook_secret or not secrets.compare_digest(x_webhook_secret.encode(), attendu.encode()):
+        raise HTTPException(401, "Secret du webhook absent ou incorrect")
+
+
+@app.post("/webhooks/alerts", status_code=202,
+          responses={401: ERREURS[401], 404: ERREURS[404]},
+          dependencies=[Depends(verifier_secret)], summary="Reçoit une alerte et relance le conteneur")
+def recevoir_alerte(alerte: Alerte):
+    global remediations
+    # Sérialiser les alertes empêche deux redémarrages pour la même panne.
+    with verrou_webhook:
+        conteneur = lire_conteneur(alerte.container)
+        if conteneur.state != "running":
+            docker("POST", f"/containers/{conteneur.id}/start")
+            conteneur = lire_conteneur(conteneur.id)
+            if conteneur.state != "running":
+                raise HTTPException(502, "Le conteneur n'a pas redémarré")
+            remediations += 1
+            journal.info("Remédiation : conteneur %s redémarré", conteneur.name)
+        synchroniser(conteneur)
+    return {"status": "accepted"}
+
+
+@app.get("/metrics", response_class=PlainTextResponse,
+         summary="Expose les métriques au format Prometheus")
+def metriques():
+    etats = Counter(c.state for c in lister_conteneurs())
+    lignes = [
+        "# HELP adminapi_containers Nombre de conteneurs gérés par état.",
+        "# TYPE adminapi_containers gauge",
+    ]
+    for etat in ("created", "running", "paused", "restarting", "removing", "exited", "dead"):
+        lignes.append(f'adminapi_containers{{state="{etat}"}} {etats[etat]}')
+    with verrou_webhook:
+        compteur = remediations
+    lignes.extend([
+        "# HELP adminapi_remediations_total Nombre de redémarrages par le webhook.",
+        "# TYPE adminapi_remediations_total counter",
+        f"adminapi_remediations_total {compteur}",
+    ])
+    return PlainTextResponse("\n".join(lignes) + "\n", media_type="text/plain; version=0.0.4")

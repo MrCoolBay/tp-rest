@@ -39,6 +39,9 @@ class TestsAPI(unittest.TestCase):
         self.requetes = patch("main.requests.request")
         self.http = self.requetes.start()
         self.addCleanup(self.requetes.stop)
+        self.compteur = patch("main.remediations", 0)
+        self.compteur.start()
+        self.addCleanup(self.compteur.stop)
 
     def test_sante_et_docs_sans_token(self):
         self.client.headers.clear()
@@ -159,6 +162,72 @@ class TestsAPI(unittest.TestCase):
         with self.assertRaises(HTTPException) as erreur:
             netbox("GET", "/status/")
         self.assertEqual(erreur.exception.status_code, 502)
+
+    def test_webhook_secret_obligatoire(self):
+        self.client.headers.clear()
+        for entetes in ({}, {"X-Webhook-Secret": "faux"}):
+            resultat = self.client.post("/webhooks/alerts", headers=entetes,
+                                        json={"alert": "container_down", "container": "web1"})
+            self.assertEqual(resultat.status_code, 401)
+        self.http.assert_not_called()
+
+    def test_webhook_validation(self):
+        for corps in ({"alert": "disk_full", "container": "web1"},
+                      {"alert": "container_down", "container": "../web1"}, {}):
+            self.assertEqual(self.client.post("/webhooks/alerts", json=corps,
+                             headers={"X-Webhook-Secret": "webhook-test"}).status_code, 422)
+        self.http.assert_not_called()
+
+    def test_webhook_non_gere(self):
+        self.http.return_value = reponse(detail(gere=False))
+        resultat = self.client.post("/webhooks/alerts", json={"alert": "container_down", "container": "web1"},
+                                    headers={"X-Webhook-Secret": "webhook-test"})
+        self.assertEqual(resultat.status_code, 404)
+        self.assertEqual(self.http.call_count, 1)
+
+    @patch("main.synchroniser")
+    def test_webhook_remediation_et_rejeu(self, sync):
+        import main
+        self.client.headers.clear()
+        self.http.side_effect = [reponse(detail(etat="exited")), reponse(statut=204),
+                                 reponse(detail()), reponse(detail())]
+        for _ in range(2):
+            resultat = self.client.post("/webhooks/alerts", json={"alert": "container_down", "container": "web1"},
+                                        headers={"X-Webhook-Secret": "webhook-test"})
+            self.assertEqual(resultat.status_code, 202)
+        self.assertEqual(main.remediations, 1)
+        actions = [appel for appel in self.http.call_args_list if appel.args[0] == "POST"]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(sync.call_count, 2)
+
+    def test_metriques_publiques(self):
+        self.client.headers.clear()
+        self.http.return_value = reponse([])
+        resultat = self.client.get("/metrics")
+        self.assertEqual(resultat.status_code, 200)
+        self.assertTrue(resultat.headers["content-type"].startswith("text/plain"))
+        self.assertIn("# TYPE adminapi_containers gauge", resultat.text)
+        self.assertIn('adminapi_containers{state="running"} 0', resultat.text)
+        self.assertIn('adminapi_containers{state="exited"} 0', resultat.text)
+        self.assertIn("# TYPE adminapi_remediations_total counter", resultat.text)
+        self.assertIn("adminapi_remediations_total 0", resultat.text)
+
+    def test_documentation_codes_erreur(self):
+        from verifier import OPERATIONS
+        chemins = self.client.get("/openapi.json").json()["paths"]
+        normalises = {chemin.replace("{identifiant}", "{}") for chemin in chemins}
+        for _, chemin in OPERATIONS:
+            self.assertIn(chemin, normalises)
+        self.assertIn("409", chemins["/containers"]["post"]["responses"])
+        self.assertIn("HTTPBearer", str(chemins["/containers"]["get"]["security"]))
+        self.assertEqual(chemins["/webhooks/alerts"]["post"]["parameters"][0]["in"], "header")
+
+    def test_cluster_netbox_cree_si_absent(self):
+        from main import cluster_netbox
+        self.http.side_effect = [reponse({"results": []}), reponse({"results": []}),
+                                 reponse({"id": 2}, 201), reponse({"id": 3}, 201)]
+        self.assertEqual(cluster_netbox(), 3)
+        self.assertEqual(self.http.call_args.kwargs["json"], {"name": "docker-local", "type": 2})
 
     def test_docker_indisponible(self):
         self.http.side_effect = requests.ConnectionError()
